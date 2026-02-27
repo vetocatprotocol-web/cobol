@@ -1,3 +1,4 @@
+    # Pastikan tidak ada triple-quoted string literal yang terbuka di akhir file
 """
 COBOL Protocol - Nafal Faturizki Edition
 Ultra-Extreme 8-Layer Decentralized Compression Engine
@@ -459,6 +460,8 @@ class CryptographicWrapper:
         # Derive encryption key from layer dictionary hash and global registry
         key_material = layer_dict_hash + self.global_registry.get_combined_hash()
         key = hashlib.sha256(key_material).digest()  # 32 bytes for AES-256
+        logger.info(f"L1 ENCRYPT key_material: {key_material.hex()}")
+        logger.info(f"L1 ENCRYPT key: {key.hex()}")
 
         # Generate random nonce (96 bits for GCM)
         import secrets
@@ -467,6 +470,7 @@ class CryptographicWrapper:
         # Prepare additional authenticated data (metadata for integrity)
         # Use layer number + hash of compressed data to prevent tampering
         aad = struct.pack(">B", self.layer_num) + hashlib.sha256(data).digest()[:8]
+        logger.info(f"L1 ENCRYPT AAD: {aad.hex()}")
         if additional_authenticated_data:
             aad = aad + additional_authenticated_data
 
@@ -522,11 +526,15 @@ class CryptographicWrapper:
         # Derive decryption key (same as encryption)
         key_material = layer_dict_hash + self.global_registry.get_combined_hash()
         key = hashlib.sha256(key_material).digest()
+        logger.info(f"L1 DECRYPT key_material: {key_material.hex()}")
+        logger.info(f"L1 DECRYPT key: {key.hex()}")
 
-        # Prepare AAD (must match encryption) - use hash of ciphertext to verify data integrity
-        aad = struct.pack(">B", layer_num) + hashlib.sha256(ciphertext).digest()[:8]
-        if additional_authenticated_data:
-            aad = aad + additional_authenticated_data
+        # Prepare AAD (must match encryption) - gunakan hash dari data terkompresi (additional_authenticated_data) jika diberikan
+        if additional_authenticated_data is not None:
+            aad = struct.pack(">B", layer_num) + additional_authenticated_data
+        else:
+            aad = struct.pack(">B", layer_num) + hashlib.sha256(ciphertext).digest()[:8]
+        logger.info(f"L1 DECRYPT AAD: {aad.hex()}")
 
         # Decrypt using AES-256-GCM
         cipher = AESGCM(key)
@@ -1160,6 +1168,7 @@ class DictionaryManager:
 # ============================================================================
 
 
+
 class AdaptiveEntropyDetector:
     """
     Detects data entropy to determine if compression should be applied.
@@ -1171,6 +1180,11 @@ class AdaptiveEntropyDetector:
     Uses NumPy vectorization for fast entropy calculation even on petabyte-scale
     data through sampling strategies.
     """
+
+    def cache_reset(self) -> None:
+        """Reset entropy cache and next cache key for new block processing."""
+        self._entropy_cache.clear()
+        self._next_cache_key = 0
 
     def __init__(self, config: EntropyConfig):
         """
@@ -1314,10 +1328,10 @@ class Layer1SemanticMapper:
         2. Tokenize text
         3. For each token: look up ID or encode as escape sequence
         4. Emit IDs as byte stream
-        5. Encrypt using AES-256-GCM with dictionary hash as salt
-        6. Attach token metadata
-        
-        Args:
+            # Simpan hash, global_registry, dan dictionary di metadata untuk digunakan saat dekompresi
+            metadata.dict_hash = dict_hash
+            metadata.global_registry = self.global_registry
+            metadata.dictionary = self.dictionary
             data: Input bytes
             
         Returns:
@@ -1332,6 +1346,7 @@ class Layer1SemanticMapper:
 
             # Tokenize
             tokens = self._tokenize_semantic(text)
+            logger.info(f"L1 Dictionary hash before compress: {hashlib.sha256(self.dictionary.serialize()).hexdigest()}")
 
             # Compress to IDs
             output = io.BytesIO()
@@ -1359,6 +1374,8 @@ class Layer1SemanticMapper:
             dict_hash = self.dictionary_manager.get_dictionary_hash("L1_SEMANTIC") or \
                        hashlib.sha256(self.dictionary.serialize()).digest()
 
+
+
             # Apply AES-256-GCM encryption
             encrypted_data, nonce, tag = self.crypto_wrapper.wrap_with_encryption(
                 compressed_data,
@@ -1370,6 +1387,7 @@ class Layer1SemanticMapper:
             encrypted_size = len(encrypted_data)
             ratio = original_size / encrypted_size if encrypted_size > 0 else 0
 
+
             metadata = CompressionMetadata(
                 block_id=0,
                 original_size=original_size,
@@ -1378,6 +1396,10 @@ class Layer1SemanticMapper:
                 layers_applied=[CompressionLayer.L1_SEMANTIC_MAPPING],
                 integrity_hash=hashlib.sha256(data).digest(),
             )
+            # Simpan hash, global_registry, dan dictionary di metadata untuk digunakan saat dekompresi
+            metadata.dict_hash = dict_hash
+            metadata.global_registry = self.global_registry
+            metadata.dictionary = self.dictionary
 
             logger.info(
                 f"L1 Compression+Encryption: {original_size} -> {encrypted_size} bytes "
@@ -1413,14 +1435,27 @@ class Layer1SemanticMapper:
             DecompressionError: If decompression fails
         """
         try:
-            # Get dictionary hash for decryption
-            dict_hash = self.dictionary_manager.get_dictionary_hash("L1_SEMANTIC") or \
-                       hashlib.sha256(self.dictionary.serialize()).digest()
+            # Gunakan hash dan global_registry yang sama seperti saat kompresi
+            dict_hash = getattr(metadata, 'dict_hash', None)
+            global_registry = getattr(metadata, 'global_registry', None)
+            dictionary = getattr(metadata, 'dictionary', None)
+            if dict_hash is None:
+                dict_hash = self.dictionary_manager.get_dictionary_hash("L1_SEMANTIC") or \
+                           hashlib.sha256(self.dictionary.serialize()).digest()
+            if global_registry is not None:
+                self.crypto_wrapper = CryptographicWrapper(global_registry, 1)
+            if dictionary is not None:
+                self.dictionary = dictionary
 
+            logger.info(f"L1 Dictionary hash before decompress: {hashlib.sha256(self.dictionary.serialize()).hexdigest()}")
             # Decrypt using AES-256-GCM
+            aad_hash = getattr(metadata, 'aad_hash', None)
+            if aad_hash is None:
+                raise DecompressionError("AAD hash missing in metadata for Layer 1 decryption")
             decrypted_data = self.crypto_wrapper.unwrap_with_decryption(
                 data,
-                dict_hash
+                dict_hash,
+                aad_hash
             )
 
             # Now decompress the decrypted data
@@ -1668,6 +1703,8 @@ class Layer2StructuralMapper:
 # ============================================================================
 
 
+class Layer2StructuralMapper:
+    """
     Layer 2: Structural Mapping - Translate Tokens into 1-2 Byte IDs
     
     Converts the output of Layer 1 (semantic tokens) into unique 1-byte or 2-byte IDs.
@@ -1929,16 +1966,13 @@ class Layer3DeltaEncoder:
             data_array = np.frombuffer(data, dtype=np.uint8)
 
             # Calculate first deltas using vectorized subtraction
-            deltas1 = np.diff(data_array)  # Vectorized: d[i] = a[i+1] - a[i]
+            deltas1 = np.diff(data_array).astype(np.int64)  # Vectorized: d[i] = a[i+1] - a[i]
 
-            # Calculate second deltas (delta-of-delta)
-            deltas2 = np.diff(deltas1)  # Vectorized: dd[i] = d[i+1] - d[i]
-
-            # Convert to signed integers for proper delta encoding
-            deltas2_signed = deltas2.astype(np.int8)
+            # Calculate second deltas (delta-of-delta) with fixed-point integer
+            deltas2 = np.diff(deltas1).astype(np.int64)  # Vectorized: dd[i] = d[i+1] - d[i]
 
             # Apply mathematical shuffling to hide patterns from frequency analysis
-            shuffled_deltas = self.shuffler.shuffle_deltas(deltas2_signed)
+            shuffled_deltas = self.shuffler.shuffle_deltas(deltas2)
 
             # Handle zero runs (frequent in structured data)
             compressed_deltas = self._encode_zero_runs(shuffled_deltas)
@@ -2617,6 +2651,7 @@ class Layer7InstructionGenerator:
 
     @staticmethod
     def _generate_instructions(data: bytes) -> bytes:
+        pass
 # ============================================================================
 # LAYER 4: VARIABLE BIT-PACKING IMPLEMENTATION
 # ============================================================================
@@ -3835,7 +3870,8 @@ if __name__ == "__main__":
     The quick brown fox jumps over the lazy dog. This is a sample text for
     compression testing. The COBOL Protocol is designed for ultra-extreme
     compression of LLM datasets with a target ratio of 1:100,000,000.
-    """ * 10
+    """
+    sample_text = sample_text * 10
 
     print(f"\nOriginal data size: {len(sample_text):,} bytes")
 

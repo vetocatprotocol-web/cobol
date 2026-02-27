@@ -230,6 +230,51 @@ class TestLayer1SemanticMapper:
 
         assert decompressed == data
 
+    def test_semantic_spacing_edge_cases(self):
+        """Test Layer 1: leading, trailing, and multiple spaces are preserved."""
+        config = DictionaryConfig(max_size=256)
+        manager = DictionaryManager(config)
+        mapper = Layer1SemanticMapper(manager)
+
+        cases = [
+            b"  leading",
+            b"trailing  ",
+            b"multiple   spaces",
+            b"   ",
+            b"a b  c   d",
+        ]
+        for data in cases:
+            compressed, metadata = mapper.compress(data)
+            decompressed = mapper.decompress(compressed, metadata)
+            assert decompressed == data
+
+    def test_delta_high_variance_numeric(self):
+        """Test Layer 3: large numeric sequence with high variance for delta-of-delta reversibility."""
+        config = DictionaryConfig(max_size=256)
+        manager = DictionaryManager(config)
+        encoder = Layer3DeltaEncoder(manager)
+
+        np.random.seed(42)
+        data = np.random.randint(0, 256, 4096, dtype=np.uint8).tobytes()
+        compressed, metadata = encoder.compress(data)
+        decompressed = encoder.decompress(compressed, metadata)
+        assert decompressed == data
+
+    def test_sha256_integrity_post_decompression(self):
+        """Verify SHA-256 hash matches after full decompress (all layers)."""
+        config = DictionaryConfig(max_size=256)
+        manager = DictionaryManager(config)
+        mapper = Layer1SemanticMapper(manager)
+        encoder = Layer3DeltaEncoder(manager)
+
+        data = b"Verify hash after decompress!   " * 100
+        compressed1, meta1 = mapper.compress(data)
+        decompressed1 = mapper.decompress(compressed1, meta1)
+        compressed3, meta3 = encoder.compress(decompressed1)
+        decompressed3 = encoder.decompress(compressed3, meta3)
+        assert decompressed3 == data
+        assert hashlib.sha256(decompressed3).digest() == hashlib.sha256(data).digest()
+
 
 # ============================================================================
 # LAYER 3: DELTA ENCODING TESTS
