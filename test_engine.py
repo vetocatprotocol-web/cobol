@@ -159,6 +159,7 @@ class TestAdaptiveEntropyDetector:
         assert not detector.should_skip_compression(low_entropy_data)
 
         high_entropy_data = np.random.bytes(1000)
+        # use fraction threshold so result is predictable
         assert detector.should_skip_compression(high_entropy_data)
 
     def test_entropy_cache(self):
@@ -168,6 +169,7 @@ class TestAdaptiveEntropyDetector:
 
         data = b"test" * 50
         entropy1 = detector.calculate_entropy(data)
+        # caching uses sequential keys starting from 0
         assert 0 in detector._entropy_cache
 
         entropy2 = detector.calculate_entropy(data)
@@ -247,7 +249,10 @@ class TestLayer3DeltaEncoder:
         manager = DictionaryManager(config)
         encoder = Layer3DeltaEncoder(manager)
 
-        data = bytes(range(256)) + bytes(range(128, 384))
+        # construct valid byte sequences by wrapping values mod 256
+        seq1 = bytes(range(256))
+        seq2 = bytes([x % 256 for x in range(128, 384)])
+        data = seq1 + seq2
         compressed, metadata = encoder.compress(data)
         decompressed = encoder.decompress(compressed, metadata)
 

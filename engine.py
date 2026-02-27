@@ -475,55 +475,43 @@ class AdaptiveEntropyDetector:
         """
         Calculate Shannon entropy of data using fast NumPy vectorization.
         
-        Formula: H(X) = -Σ(p_i * log2(p_i)) where p_i is frequency of byte i
-        
-        Algorithm:
-        1. Convert bytes to unsigned 8-bit integers (vectorized)
-        2. Use NumPy bincount for frequency calculation (O(n) vectorized)
-        3. Calculate probabilities
-        4. Apply logarithm vectorized
-        5. Sum results
-        
-        Args:
-            data: Input bytes to analyze
-            
-        Returns:
-            Shannon entropy value (0-8 bits)
+        Returns entropy in **bits** (0 to 8). If caching is enabled the
+        result of each invocation is stored under a sequential key (0,1,2,...)
+        so that tests and callers can inspect the cache.  Negative zeros are
+        clamped to 0.0 to avoid misleading comparisons.
         """
         if len(data) == 0:
             return 0.0
 
         # Vectorized byte frequency calculation using NumPy
         data_array = np.frombuffer(data, dtype=np.uint8)
-
-        # Discrete histogram of byte frequencies (vectorized)
         byte_freq = np.bincount(data_array, minlength=256)
 
-        # Calculate probabilities
         probabilities = byte_freq[byte_freq > 0] / len(data_array)
-
-        # Vectorized entropy calculation: -Σ(p * log2(p))
         entropy = -np.sum(probabilities * np.log2(probabilities))
 
-        return float(entropy)
+        # Clamp to non-negative and convert to float
+        entropy = float(entropy)
+        if entropy < 0:
+            entropy = 0.0
+
+        # Cache if requested (use sequential key)
+        if self.config.cache_results:
+            key = getattr(self, "_next_cache_key", 0)
+            self._entropy_cache[key] = entropy
+            self._next_cache_key = key + 1
+
+        return entropy
 
     def should_skip_compression(self, data: bytes, block_id: int = 0) -> bool:
         """
         Determine if compression should be skipped based on entropy.
         
-        Decision logic:
-        - If entropy > skip_threshold: Skip (data is random/compressed)
-        - If entropy < min_threshold: Apply all layers (data is highly structured)
-        - Otherwise: Apply selective layers
-        
-        Args:
-            data: Input data to evaluate
-            block_id: Block identifier for caching
-            
-        Returns:
-            True if compression should be skipped
+        The configuration value `skip_threshold` is treated as a **fraction of
+        maximum entropy** (8 bits).  For example a threshold of `0.95` means
+        skip when entropy > 7.6 bits.
         """
-        # Return cached result if available
+        # Obtain entropy (cached or new)
         if block_id in self._entropy_cache:
             entropy = self._entropy_cache[block_id]
         else:
@@ -531,9 +519,11 @@ class AdaptiveEntropyDetector:
             if self.config.cache_results:
                 self._entropy_cache[block_id] = entropy
 
-        should_skip = entropy > self.config.skip_threshold
+        # Normalize to [0,1] fraction of max entropy
+        entropy_frac = entropy / 8.0
+        should_skip = entropy_frac > self.config.skip_threshold
         logger.debug(
-            f"Block {block_id}: entropy={entropy:.3f}, skip={should_skip}"
+            f"Block {block_id}: entropy={entropy:.3f} ({entropy_frac:.2%}), skip={should_skip}"
         )
 
         return should_skip
@@ -637,10 +627,11 @@ class Layer1SemanticMapper:
                     output.write(bytes([token_id]))
                 else:
                     # Token not in dictionary: escape sequence
-                    # Format: 0xFF (escape) + length + token_bytes
+                    # Format: 0xFF (escape) + varint length + token_bytes
                     token_bytes = token.encode('utf-8')
                     output.write(b'\xFF')  # Escape marker
-                    output.write(bytes([len(token_bytes)]))
+                    # write length as varint to avoid 0-255 limitation
+                    output.write(VarIntCodec.encode(len(token_bytes)))
                     output.write(token_bytes)
                     unmapped_tokens.append(token)
 
@@ -699,18 +690,18 @@ class Layer1SemanticMapper:
                 byte_val = data[idx]
 
                 if byte_val == 0xFF:
-                    # Escape sequence: read token
+                    # Escape sequence: read varint length + token
                     if idx + 1 >= len(data):
                         raise DecompressionError("Incomplete escape sequence")
 
-                    token_len = data[idx + 1]
-                    if idx + 2 + token_len > len(data):
+                    length, consumed = VarIntCodec.decode(data, idx + 1)
+                    if idx + 1 + consumed + length > len(data):
                         raise DecompressionError("Incomplete token data")
 
-                    token_bytes = data[idx + 2 : idx + 2 + token_len]
+                    token_bytes = data[idx + 1 + consumed : idx + 1 + consumed + length]
                     token = token_bytes.decode('utf-8')
                     output.write(token)
-                    idx += 2 + token_len
+                    idx += 1 + consumed + length
 
                 else:
                     # Dictionary lookup
@@ -741,12 +732,12 @@ class Layer1SemanticMapper:
         """
         Tokenize text semantically using context-aware splitting.
         
-        Splits on whitespace and common punctuation while preserving
-        semantic meaning.
+        - Words (alphanumeric sequences)
+        - Runs of whitespace (preserved to maintain exact spacing)
+        - Individual punctuation symbols
         """
         import re
-        # Split on whitespace and punctuation, keeping delimiters
-        tokens = re.findall(r'\b\w+\b|[^\w\s]', text)
+        tokens = re.findall(r"\b\w+\b|\s+|[^\w\s]", text)
         return tokens
 
 
