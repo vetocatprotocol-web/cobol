@@ -1,0 +1,20 @@
+/workspaces/cobol/fpga_api_server.py:435: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("startup")
+/workspaces/cobol/fpga_api_server.py:443: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("shutdown")
+INFO:__main__:Starting API server on 0.0.0.0:8000
+INFO:     Started server process [25591]
+INFO:     Waiting for application startup.
+INFO:__main__:COBOL v1.5 FPGA Control API Starting...
+INFO:__main__:Initializing FPGA cluster with 5000 devices
+INFO:fpga_controller:Initialized FPGACluster for 5000 devices

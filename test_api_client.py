@@ -274,6 +274,31 @@ def test_cluster_metrics():
         print(f"  ✗ Failed: {e}")
 
 
+def test_containers():
+    """Test container listing endpoint"""
+    print("\n[TEST] Container Listing")
+    client = FPGAAPIClient()
+    try:
+        result = client.session.get(f"{client.base_url}/containers").json()
+        print(f"  ✓ Total Containers: {result.get('total_containers')}")
+        assert 'containers' in result
+    except Exception as e:
+        print(f"  ✗ Failed: {e}")
+
+
+def test_economics():
+    """Test economics endpoints"""
+    print("\n[TEST] Economic Calculations")
+    client = FPGAAPIClient()
+    try:
+        tco = client.session.get(f"{client.base_url}/economics/tco?eb=15").json()
+        print(f"  ✓ Cloud cost/yr: {tco['cloud_cost_per_year']}")
+        be = client.session.get(f"{client.base_url}/economics/break_even?eb=15").json()
+        print(f"  ✓ Break-even year: {be['break_even_year']}")
+    except Exception as e:
+        print(f"  ✗ Failed: {e}")
+
+
 def test_device_history():
     """Test metrics history"""
     print("\n[TEST] Device Metrics History")

@@ -12,7 +12,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from fpga_controller import FPGAController, FPGACluster, CAMEntry, HuffmanTable, FPGAMetrics
+from fpga_controller import FPGAController, FPGACluster, CAMEntry, HuffmanTable, FPGAMetrics, MobileContainerDC, EconomicModel
 
 
 # ============================================================================
@@ -380,6 +380,52 @@ class TestPerformanceBenchmarks:
         logger.info(f"Collected {len(history)} metrics samples in 1 second")
         assert len(history) > 50  # At least 50 samples in 1 second
 
+
+# ============================================================================
+# ECONOMICS & CONTAINER MANAGEMENT
+# ============================================================================
+
+class TestMobileContainerDC:
+    """Test mobile container data center abstraction"""
+
+    def test_container_initialization(self):
+        """Each container should manage its own FPGACluster"""
+        mcdc = MobileContainerDC(container_id=1, num_fpgas=500, location="SiteA")
+        assert mcdc.container_id == 1
+        assert mcdc.location == "SiteA"
+        assert mcdc.total_power() == 400.0
+        assert mcdc.total_cooling() == 420.0
+        # initialize a few FPGAs
+        dev0 = mcdc.initialize_fpga(0, use_simulator=True)
+        dev1 = mcdc.initialize_fpga(1, use_simulator=True)
+        assert dev0.device_id == 0
+        assert dev1.device_id == 1
+        assert len(mcdc.devices.devices) == 2
+
+    def test_summary_output(self):
+        mcdc = MobileContainerDC(container_id=2)
+        summary = mcdc.summary()
+        assert 'container_id' in summary
+        assert summary['num_fpgas'] == 500
+
+
+class TestEconomicModel:
+    """Test cost estimation and break-even calculations"""
+
+    def test_cloud_vs_fpga_tco(self):
+        model = EconomicModel()
+        cloud = model.cloud_tco(15)
+        fpga = model.fpga_tco(15)
+        # cloud cost should exceed CAPEX alone
+        assert cloud > fpga['capex']
+        assert fpga['opex_per_year'] > 0
+        assert fpga['total_cost_over_life'] > fpga['capex']
+
+    def test_break_even(self):
+        model = EconomicModel()
+        year = model.break_even_year(15)
+        assert year > 0
+        assert isinstance(year, int)
 
 # ============================================================================
 # ERROR HANDLING & RESILIENCE

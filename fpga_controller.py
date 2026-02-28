@@ -14,7 +14,7 @@ import time
 import threading
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 import hashlib
@@ -563,6 +563,96 @@ class FPGACluster:
         return f"FPGACluster(devices={len(self.devices)}/{self.num_devices})"
 
 
+# ============================================================================
+# MOBILE CONTAINER & ECONOMICS
+# ============================================================================
+
+from dataclasses import dataclass, field
+
+@dataclass
+class PowerCoolingSpecs:
+    power_kw: float  # kilowatts consumed per container
+    cooling_kw: float  # kilowatts cooling capacity needed
+    heat_recovery_kw: float = 0.0  # optional recovered heat
+
+
+@dataclass
+class MobileContainerDC:
+    """Represents a mobile container data center with a fixed number of FPGAs"""
+    container_id: int
+    num_fpgas: int = 500
+    power_specs: PowerCoolingSpecs = field(default_factory=lambda: PowerCoolingSpecs(power_kw=400.0, cooling_kw=420.0))
+    location: str = "unspecified"
+    devices: FPGACluster = None
+
+    def __post_init__(self):
+        self.devices = FPGACluster(num_devices=self.num_fpgas)
+        # lazy-initialize devices on demand
+
+    def initialize_fpga(self, idx: int, use_simulator: bool = True):
+        return self.devices.initialize_device(idx, use_simulator=use_simulator)
+
+    def total_power(self) -> float:
+        """Return total electrical load (kW) of this container"""
+        return self.power_specs.power_kw
+
+    def total_cooling(self) -> float:
+        """Return cooling capacity required (kW)"""
+        return self.power_specs.cooling_kw
+
+    def summary(self) -> dict:
+        return {
+            'container_id': self.container_id,
+            'num_fpgas': self.num_fpgas,
+            'location': self.location,
+            'power_kw': self.total_power(),
+            'cooling_kw': self.total_cooling()
+        }
+
+
+@dataclass
+class EconomicModel:
+    """Simple TCO calculator for storage vs FPGA infra"""
+    cloud_cost_per_eb_per_year: float = 2_000_000.0  # example $/EB
+    fpga_capex_per_500: float = 2_500_000.0  # cost per container (500 FPGA)
+    electric_cost_per_kw_year: float = 0.15  # $ per kW per year
+    power_per_container_kw: float = 400.0
+    num_containers: int = 10
+    lifespan_years: int = 5
+
+    def cloud_tco(self, eb: float) -> float:
+        """Total cost of ownership for storing eb exabytes in cloud per year"""
+        return eb * self.cloud_cost_per_eb_per_year
+
+    def fpga_tco(self, eb: float) -> dict:
+        """Estimate CAPEX + OPEX over lifespan for FPGA infrastructure"""
+        capex = self.num_containers * self.fpga_capex_per_500
+        opex_year = self.num_containers * self.power_per_container_kw * self.electric_cost_per_kw_year
+        total_opex = opex_year * self.lifespan_years
+        effective_tb = eb  # assume capable
+        return {
+            'capex': capex,
+            'opex_per_year': opex_year,
+            'total_opex_over_life': total_opex,
+            'total_cost_over_life': capex + total_opex
+        }
+
+    def break_even_year(self, eb: float) -> float:
+        """Approximate years to break even compared to cloud"""
+        cloud_yearly = self.cloud_tco(eb)
+        fpga = self.fpga_tco(eb)
+        # compute year when cumulative fpga cost < cumulative cloud cost
+        cumulative_fpga = fpga['capex']
+        year = 0
+        while cumulative_fpga < cloud_yearly * year:
+            year += 1
+            cumulative_fpga += fpga['opex_per_year']
+            if year > self.lifespan_years * 2:
+                break
+        return year
+
+
+# quick example utilities
 if __name__ == "__main__":
     # Quick test
     print("=== FPGA Controller Test ===\n")

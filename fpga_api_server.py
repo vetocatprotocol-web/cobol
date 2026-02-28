@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import websockets
 
-from fpga_controller import FPGAController, FPGACluster, HuffmanTable, FPGAMetrics
+from fpga_controller import FPGAController, FPGACluster, HuffmanTable, FPGAMetrics, MobileContainerDC, EconomicModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -337,6 +337,35 @@ async def websocket_cluster_metrics(websocket: WebSocket):
 
 
 # ============================================================================
+# CONTAINER & ECONOMICS ENDPOINTS
+
+@app.get("/api/containers")
+async def list_containers() -> Dict:
+    """Return summary of all mobile containers in the cluster"""
+    cluster = get_cluster()
+    # for simplicity assume each group of 500 devices == one container
+    count = (len(cluster.devices) + 499) // 500
+    containers = []
+    for cid in range(count):
+        cont = MobileContainerDC(container_id=cid)
+        containers.append(cont.summary())
+    return {'total_containers': count, 'containers': containers}
+
+@app.get("/api/economics/tco")
+async def compute_tco(eb: float = Query(15.0, ge=0.1)) -> Dict:
+    """Compute TCO for cloud vs FPGA infra for given EB"""
+    model = EconomicModel()
+    cloud = model.cloud_tco(eb)
+    fpga = model.fpga_tco(eb)
+    return {'eb': eb, 'cloud_cost_per_year': cloud, 'fpga': fpga}
+
+@app.get("/api/economics/break_even")
+async def compute_break_even(eb: float = Query(15.0, ge=0.1)) -> Dict:
+    """Estimate break-even year"""
+    model = EconomicModel()
+    year = model.break_even_year(eb)
+    return {'eb': eb, 'break_even_year': year}
+
 # HEALTH & INFO ENDPOINTS
 # ============================================================================
 
@@ -376,6 +405,9 @@ async def get_api_info() -> Dict:
             'huffman_load': 'POST /api/devices/{device_id}/huffman/load',
             'cluster_metrics': '/api/metrics/cluster',
             'device_history': '/api/metrics/device/{device_id}/history',
+            'containers': '/api/containers',
+            'tco': '/api/economics/tco',
+            'break_even': '/api/economics/break_even',
             'ws_metrics': 'ws://host/ws/metrics/{device_id}',
             'ws_cluster': 'ws://host/ws/cluster',
         }

@@ -11,6 +11,8 @@
 
 ## 🚀 v1.4 Status (CURRENT - Feb 28, 2026) - HPC Optimization Phase 1 + v1.3 Bridge Foundation
 
+<!-- New Exabyte-scale section added below -->
+
 ### v1.4: HPC Maximum Performance (Phase 1-3 Framework Ready) ✅
 
 **HPC Performance Trajectory:** 35 MB/s (v1.3) → 200+ MB/s (Phase 1 DMA+Parallelism) → 150-300+ MB/s (Phase 2 Numba JIT) → 300-500+ MB/s (Phase 3 GPU)  
@@ -55,7 +57,110 @@ engine.cleanup()
 
 ---
 
-## 🚀 v1.3 Status (PREVIOUS - Feb 28, 2026) - Strict-Typed Bridge + HPC Foundation
+
+---
+
+## 🚀 v1.5 Status (EXASCALE - Mar 2026) - Deployment & Economics
+
+**Target:** Full 15 EB data compression across 5 000 FPGA cluster, deployed via 10 mobile container data centers (MCDC).
+
+### 🛠️ Operasional & Ingestion Strategy (TUGAS 3)
+- **Mobile Container DCs:** 10 units @ 500 FPGA each, located at client premises to eliminate data‑gravity transfer costs.
+- **Swarm orchestration:** Each MCDC presents a REST/WebSocket gateway to local clients; cluster manager federates dictionaries, Huffman tables, and firmware updates.
+- **Data pipeline:** Ingest → CAM lookup → Huffman decompress → re‑compress local chunks (500× ratio) → encrypted spillover to central repository.
+
+#### Power & Cooling (5 000 FPGA)
+- Estimated **electrical load**: 2 MW total (400 W per container, ~4 kW/FPU stack).
+- **UPS & distribution:** 3‑phase 480 V feeds with N+1 redundancy.
+- **Cooling:** Precision liquid‑immersion racks (20 kW per rack) + closed‑loop chiller; heat-recovery system recovers 1.5 MW waste heat for facility heating.
+- **Thermal headroom:** 15 °C delta‑T at 0.5 m/s coolant flow, maintained by redundant pumps.
+
+### 🔗 Block Diagram (FPGA Architecture)
+```
++-------------------------------------------+
+|            Exascale FPGA Cluster          |
+|                                           |
+|  +----------+   +----------+   +--------+  |
+|  | CAM_BANK |-->| HASH_CORE|-->| HUFFMAN|  |
+|  +----------+   +----------+   +--------+  |
+|       ^             ^              ^        |
+|       |             |              |        |
+|  +----------+   +----------+   +--------+  |
+|  |  INGRESS |   |  DECOMP  |   |  EGRESS|  |
+|  +----------+   +----------+   +--------+  |
+|                                           |
++-------------------------------------------+
+```
+
+### 💡 Pseudocode (Verilog/VHDL) – Layer 6 Acceleration
+```verilog
+// layer6_accel.v (pseudocode)
+module layer6_accel(
+    input  logic clk,
+    input  logic rst,
+    input  logic [511:0] data_in,
+    output logic [511:0] data_out,
+    output logic valid_out
+);
+
+    // pattern matcher table stored in BRAM
+    logic [15:0] pattern_mem [0:4095];
+    logic [31:0] matched_id;
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            matched_id <= 0;
+            valid_out  <= 0;
+        end else begin
+            // simple sliding window compare
+            for (int i=0; i<512; i+=16) begin
+                if (data_in[i +: 16] == pattern_mem[i>>4]) begin
+                    matched_id <= i>>4;
+                end
+            end
+            data_out <= data_in ^ {matched_id, matched_id};
+            valid_out <= 1;
+        end
+    end
+endmodule
+```
+
+(Equivalent VHDL pseudocode exists in `layer6_accel.vhd` – see workspace.)
+
+### 📶 Network Simulation Table (2G–5G at 500× compression)
+| Access Tech | Raw BW (Mbps) | Effective GB/s after 500× | Notes |
+|-------------|---------------|---------------------------|-------|
+| 2G (EDGE)   | 0.1           | 0.00000025               | 250 B/s  |
+| 3G          | 2             | 0.000005                 | 5 KB/s   |
+| LTE         | 20            | 0.00005                  | 50 KB/s  |
+| 4G          | 100           | 0.0002                   | 200 KB/s |
+| 5G          | 1000          | 0.002                    | 2 MB/s   |
+
+> *Even narrowband connections become viable when compressed 500× – critical for remote ingestion.*
+
+### 💰 Ekonomi & Roadmap (TUGAS 4)
+- **TCO Comparison:**
+  - *Google Cloud Storage (15 EB):* → ~$30 M/year (hot tier) + egress fees
+  - *Build 5 000 FPGA infra:* CapEx ~$25 M (boards, containers, cooling) + 2 MW electricity (~$3 M/year) → OPEX ~10 M/year
+  - **Break‑even:** ≈3 years with persistent 15 EB dataset, plus data‑gravity savings.
+
+- **Roadmap v1.4 → v1.5 → v1.6:**
+  1. **v1.4 (HPC Foundation):** Completed on Feb 28 2026.
+  2. **v1.5 (Exascale Deployment):** Mar‑Apr 2026 – containerized FPGA clusters, mobile DCs, power/cooling design, initial field trials.
+  3. **v1.6 (Exascale Ready):** Q3 2026 – automated orchestration, AI‑driven dictionary updates, quantum‑resistant security, transition toward satellite‑linked pods.
+
+---
+
+## 🎯 Updated Roadmap Summary
+
+| Version | Focus | Deliverables | Timeline |
+|---------|-------|--------------|----------|
+| v1.4    | HPC software | DMA, Numba, GPU | Feb 2026 ✓ |
+| v1.5    | Hardware rollout | 5 000 FPGA in 10 containers | Mar‑Apr 2026 |
+| v1.6    | Autonomous exascale | AI orchestration, QKD | Q3 2026 |
+
+---
+
 
 ### v1.3: Strict-Typed Protocol Bridge (L1-L8) with 100% Backward Compatibility ✅
 
