@@ -1,4 +1,4 @@
-# Pastikan tidak ada triple-quoted string literal yang terbuka di akhir file
+"""Legacy utility methods removed from top; see HPCCompressionEngine class later in file."""
 """
 COBOL Protocol - Nafal Faturizki Edition
 Ultra-Extreme 8-Layer Decentralized Compression Engine
@@ -138,6 +138,89 @@ class GlobalPatternRegistry:
         key_material = self.layer_hashes[current_layer] + self.combined_hash
         key = hashlib.sha256(key_material).digest()
         return key
+
+
+class HPCCompressionEngine:
+    """
+    High-performance wrapper providing optimized compression methods.
+
+    This class aggregates utility functions previously misplaced at the
+    top of the file. It can be composed with any engine implementation to
+    provide batch, parallel and benchmarking support.
+    """
+
+    def __init__(self, base_engine):
+        self.base = base_engine
+
+    def benchmark(self, data: bytes, method: str = 'optimized', repeat: int = 5) -> dict:
+        """Benchmark throughput dan latency engine."""
+        import time
+        times = []
+        for _ in range(repeat):
+            start = time.time()
+            if method == 'optimized':
+                self.compress_optimized(data)
+            elif method == 'parallel_layers':
+                self.compress_parallel_layers(data)
+            else:
+                self.base.compress(data)
+            times.append(time.time() - start)
+        avg_time = sum(times) / len(times)
+        throughput_mb_s = len(data) / 1024 / 1024 / avg_time if avg_time > 0 else 0
+        return {
+            'method': method,
+            'repeat': repeat,
+            'avg_time_s': avg_time,
+            'throughput_mb_s': throughput_mb_s,
+            'all_times': times
+        }
+
+    def compress_parallel_layers(self, data: bytes) -> Tuple[bytes, dict]:
+        """Kompresi dengan paralelisasi antar layer (L1-L4) untuk kecepatan maksimal."""
+        import concurrent.futures, time
+        start_time = time.time()
+        layers = [self.base.layer1_semantic, self.base.layer2_structural,
+                  self.base.layer3_delta, self.base.layer4_bitpacking]
+        results = {}
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_to_layer = {executor.submit(layer.compress, data): layer for layer in layers}
+            for future in concurrent.futures.as_completed(future_to_layer):
+                layer = future_to_layer[future]
+                try:
+                    comp, meta = future.result()
+                    results[layer.__class__.__name__] = {'output': comp, 'meta': meta}
+                except Exception as exc:
+                    results[layer.__class__.__name__] = {'error': str(exc)}
+        best = max(results.values(), key=lambda x: x.get('meta',{}).get('compression_ratio',0))
+        elapsed = time.time() - start_time
+        stats = {'elapsed_time': elapsed,
+                 'best_layer': best.get('meta',{}).get('layer'),
+                 'compression_ratio': best.get('meta',{}).get('compression_ratio',1.0)}
+        return best.get('output'), stats
+
+    def compress_optimized(self, data: bytes, batch_size: int = 0) -> Tuple[bytes, dict]:
+        """Kompresi multi-layer dengan optimasi kecepatan."""
+        import concurrent.futures, time
+        start_time = time.time()
+        result = b''
+        stats = {}
+        if batch_size > 0 and len(data) > batch_size:
+            batches = [data[i:i+batch_size] for i in range(0, len(data), batch_size)]
+            results = []
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = [executor.submit(self.base.compress, batch) for batch in batches]
+                for f in concurrent.futures.as_completed(futures):
+                    comp, meta = f.result()
+                    results.append(comp)
+            result = b''.join(results)
+            stats['batch_count'] = len(batches)
+        else:
+            result, meta = self.base.compress(data)
+        if hasattr(self.base, 'dictionary_cache'):
+            stats['dictionary_cache_hits'] = getattr(self.base, 'dictionary_cache_hits', 0)
+        stats['elapsed_time'] = time.time() - start_time
+        stats['throughput_mb_s'] = len(data) / 1024 / 1024 / stats['elapsed_time'] if stats['elapsed_time'] > 0 else 0
+        return result, stats
 
     def get_layer8_iv(self) -> bytes:
         """
@@ -3102,6 +3185,26 @@ class CobolEngine:
                 metadata.entropy_score = entropy_profile['entropy']
         except CompressionError as e:
             logger.warning(f"Layer 3 failed: {e}, using previous output")
+
+        # GPU-accelerated Layer 6 & 7 (Trie search + Entropy/Huffman)
+        try:
+            from gpu_acceleration import GPUDetector, GPUTrieAccelerator
+            from huffman_gpu import build_tree, encode as huffman_encode
+            detector = GPUDetector()
+            trie_accel = GPUTrieAccelerator(detector)
+            if detector.gpu_available:
+                matches = trie_accel.search_patterns_gpu(current_data, {})
+                logger.debug(f"Layer 6 GPU matches: {len(matches)}")
+                # possible transformation based on matches could go here
+            # Layer 7 Huffman
+            import numpy as np
+            freqs = np.bincount(np.frombuffer(current_data, dtype=np.uint8), minlength=256)
+            tree_gpu, node_count = build_tree(freqs)
+            encoded = huffman_encode(current_data, tree_gpu)
+            current_data = encoded
+            applied_layers.append(CompressionLayer.L7_BANK)
+        except Exception as e:
+            logger.warning(f"GPU L6/L7 processing failed: {e}, continuing")
 
         # Attach the complete list of applied layers and finalize metadata
         # to reflect the original block sizes and final compressed size so

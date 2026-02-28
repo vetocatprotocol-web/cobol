@@ -64,20 +64,38 @@ class DualModeEngine:
     
     def compress(self, data: bytes) -> bytes:
         """
-        Compress data using selected mode.
-        
-        Args:
-            data: Raw bytes to compress
-        
-        Returns:
-            Compressed bytes
+        Compress data using selected mode with Adaptive Entropy Detection.
+        Jika entropi data > 7.5 bits/byte, proses kompresi dilewati untuk menghindari pembengkakan ukuran file.
         """
+        entropy = self._calculate_entropy(data)
+        # Adaptive Entropy Detection
+        if entropy > 7.5:
+            # Data kemungkinan sudah terkompresi/enkripsi, skip kompresi
+            print(f"[Adaptive Entropy] Data entropy tinggi ({entropy:.2f} bits/byte), kompresi dilewati.")
+            return data
+        # Data terstruktur, lanjutkan kompresi
         if self.mode == CompressionMode.LEGACY:
             return self._compress_legacy(data)
         elif self.mode == CompressionMode.BRIDGE:
             return self._compress_bridge(data)
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
+        def _calculate_entropy(self, data: bytes) -> float:
+            """
+            Hitung entropi Shannon (bits/byte) dari data.
+            """
+            if not data:
+                return 0.0
+            from math import log2
+            freq = {}
+            for b in data:
+                freq[b] = freq.get(b, 0) + 1
+            total = len(data)
+            entropy = 0.0
+            for count in freq.values():
+                p = count / total
+                entropy -= p * log2(p)
+            return entropy * 8  # bits/byte
     
     def decompress(self, data: bytes) -> bytes:
         """

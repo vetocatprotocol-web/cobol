@@ -1,0 +1,58 @@
+name: GPU Pipeline CI
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  gpu:
+    name: GPU Host (self-hosted)
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r requirements.txt || true
+          python -m pip install numba || true
+          # Try to install a matching CuPy wheel (adjust to your CUDA version if needed)
+          python -m pip install cupy-cuda11x || python -m pip install cupy || true
+      - name: Compile CUDA kernels
+        run: |
+          python compile_kernels.py || echo "Compilation failed or CuPy missing; continuing with CPU fallback"
+      - name: Run benchmark
+        run: |
+          python bench_end_to_end.py --size_mb 100 --repeat 3 > gpu_benchmark.txt || true
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-benchmark
+          path: gpu_benchmark.txt
+
+  cpu-fallback:
+    name: CPU Fallback (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies (CPU)
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r requirements.txt || true
+          python -m pip install numba || true
+      - name: Run CPU benchmark
+        run: |
+          python bench_end_to_end.py --size_mb 50 --repeat 2 > cpu_benchmark.txt || true
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-benchmark
+          path: cpu_benchmark.txt

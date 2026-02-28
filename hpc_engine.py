@@ -1,3 +1,23 @@
+import numpy as np
+from multiprocessing.shared_memory import SharedMemory
+def dma_transfer_example(data: np.ndarray, shm_name: str = 'cobol_dma_buffer') -> np.ndarray:
+    """
+    Contoh transfer data menggunakan Shared Memory DMA.
+    """
+    # Alokasi shared memory
+    shm = SharedMemory(name=shm_name, create=True, size=data.nbytes)
+    try:
+        # Write into shared memory
+        shm.buf[:data.nbytes] = data.tobytes()
+        # Read back into a numpy array view and copy out
+        received = np.frombuffer(shm.buf, dtype=data.dtype, count=data.size).copy()
+        return received
+    finally:
+        try:
+            shm.close()
+            shm.unlink()
+        except Exception:
+            pass
 """
 HPC Engine v1.4: Shared Memory DMA + Chunk-Parallel Processing
 ================================================================
