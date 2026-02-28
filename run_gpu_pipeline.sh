@@ -56,8 +56,24 @@ fi
 echo "Compiling CUDA kernels (compile_kernels.py)..."
 python compile_kernels.py || echo "Kernel compilation failed or CuPy not available; continuing with CPU fallback."
 
-# 5) Run end-to-end benchmark
-echo "Running end-to-end benchmark..."
+# 5) Run Layer 7 Huffman end-to-end tests
+echo ""
+echo "== Running Layer 7: Huffman Encoding Tests =="
+python test_huffman_end_to_end.py || echo "Some Huffman tests failed; check output above."
+
+# 5b) Run Layer 7 Huffman histogram benchmark
+echo ""
+echo "== Benchmarking Layer 7: Huffman Histogram Kernels =="
+python bench_huffman_histogram.py --size_mb $((SIZE_MB / 2)) --repeat ${REPEAT} || echo "Histogram benchmark failed."
+
+# 5c) Run Layer 7 Huffman full pipeline benchmark
+echo ""
+echo "== Benchmarking Layer 7: Full Huffman Pipeline =="
+python bench_huffman_full.py --size_mb $((SIZE_MB / 2)) --repeat ${REPEAT} || echo "Full pipeline benchmark failed."
+
+# 6) Run end-to-end benchmark
+echo ""
+echo "== Running Full Compression Engine Benchmark =="
 python bench_end_to_end.py --size_mb ${SIZE_MB} --repeat ${REPEAT}
 
 echo "Done. Review output above for throughput and errors."

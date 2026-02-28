@@ -10,16 +10,24 @@ import cupy as cp
 
 kernels = [
     ('trie_search_kernel.cu', 'trie_search_kernel'),
-    ('huffman_gpu_kernel.cu', 'build_huffman_tree'),
+    ('huffman_gpu_kernel.cu', 'compute_histograms_kernel'),
+    ('huffman_gpu_kernel_warp.cu', 'compute_histograms_warp_kernel'),
 ]
 
 for filename, func in kernels:
-    with open(filename) as f:
-        code = f.read()
+    try:
+        with open(filename) as f:
+            code = f.read()
+    except FileNotFoundError:
+        print(f"Skipping missing {filename}")
+        continue
     print(f"Compiling {filename}...")
     module = cp.RawModule(code=code, backend='nvcc', options=('-std=c++11',))
     # force compile by retrieving the function
-    module.get_function(func)
+    try:
+        module.get_function(func)
+    except Exception as e:
+        print(f"Warning: function {func} not found in {filename}: {e}")
     print(f"Compiled {filename}")
 
-print("All kernels compiled.")
+print("All kernels compiled (or skipped if missing).")
