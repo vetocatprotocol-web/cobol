@@ -49,9 +49,12 @@ class FrequencyAnalyzer:
         entropy = 0.0
         data_len = len(data)
         
+        import math
         for count in freq.values():
             p = count / data_len
-            entropy -= p * (p.bit_length() - 1) if p > 0 else 0
+            if p > 0:
+                entropy -= p * math.log2(p)
+        return entropy
         
         return entropy
     

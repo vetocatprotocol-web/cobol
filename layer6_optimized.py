@@ -329,38 +329,41 @@ class OptimizedLayer6Pipeline:
         output.write(encoded_data)
         
         compressed = output.getvalue()
-        
+        # Jika hasil kompresi lebih besar dari data asli, outputkan data asli dengan header khusus
+        if len(compressed) >= len(data):
+            compressed = b'PAT6N' + struct.pack('<I', len(data)) + data
         # Update statistics
         self.statistics['input_bytes'] = len(data)
         self.statistics['output_bytes'] = len(compressed)
         self.statistics['patterns_used'] = self.dictionary.pattern_count
         self.statistics['dictionary_size_mb'] = len(dict_bytes) / 1024 / 1024
         self.statistics['compression_ratio'] = len(data) / max(len(compressed), 1)
-        
         elapsed = time.time() - start_time
         if elapsed > 0:
             self.statistics['throughput_mbps'] = (len(data) / 1024 / 1024) / elapsed
-        
         return compressed
     
     def decompress(self, data: bytes) -> bytes:
         """Decompress L6 data"""
         stream = io.BytesIO(data)
-        
         # Read header
-        magic = stream.read(4)
-        if magic != b'PAT6':
-            raise ValueError("Invalid PAT6 magic")
-        
-        # Read dictionary
-        dict_len = struct.unpack('<I', stream.read(4))[0]
-        dict_bytes = stream.read(dict_len)
-        self.dictionary = StructuralPatternDictionary.from_bytes(dict_bytes)
-        
-        # Decode data
-        remaining = stream.read()
-        self.encoder = PatternEncoder(self.dictionary)
-        return self.encoder.decode(remaining)
+        magic = stream.read(5)
+        if magic == b'PAT6N':
+            orig_len = struct.unpack('<I', stream.read(4))[0]
+            return stream.read(orig_len)
+        else:
+            stream.seek(-1, io.SEEK_CUR)
+            magic = stream.read(4)
+            if magic != b'PAT6':
+                raise ValueError("Invalid PAT6 magic")
+            # Read dictionary
+            dict_len = struct.unpack('<I', stream.read(4))[0]
+            dict_bytes = stream.read(dict_len)
+            self.dictionary = StructuralPatternDictionary.from_bytes(dict_bytes)
+            # Decode data
+            remaining = stream.read()
+            self.encoder = PatternEncoder(self.dictionary)
+            return self.encoder.decode(remaining)
     
     def memory_profile(self) -> Dict:
         """Memory usage"""

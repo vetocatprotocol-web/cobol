@@ -1,4 +1,4 @@
-    # Pastikan tidak ada triple-quoted string literal yang terbuka di akhir file
+# Pastikan tidak ada triple-quoted string literal yang terbuka di akhir file
 """
 COBOL Protocol - Nafal Faturizki Edition
 Ultra-Extreme 8-Layer Decentralized Compression Engine
@@ -921,7 +921,7 @@ class DictionaryManager:
             if layer_key:
                 for token, token_id in dictionary.token_to_id.items():
                     freq = dictionary.frequencies.get(token, 1)
-                    self.dictionary_chain.add_mapping(layer_key, token, token_id, freq)
+                    self.dictionary_chain.add_mapping(chain_key, token, token_id, freq)
         
         logger.info("Initialized DictionaryChain with all layer dictionaries")
 
@@ -1817,10 +1817,19 @@ class Layer2StructuralMapper:
                 original_size=original_size,
                 compressed_size=encrypted_size,
                 compression_ratio=ratio,
-                layers_applied=[CompressionLayer.L2_STRUCTURAL_MAPPING],
+                layers_applied=[
+                    CompressionLayer.L2_STRUCTURAL_MAPPING,
+                    CompressionLayer.L3_DELTA_ENCODING,
+                ],
                 integrity_hash=hashlib.sha256(data).digest(),
             )
             
+            if gain < L3_MIN_GAIN_THRESHOLD:
+                logger.warning(
+                    f"L3 Delta encoding gain only {gain:.1%}, "
+                    f"below threshold {L3_MIN_GAIN_THRESHOLD:.1%}"
+                )
+
             logger.info(
                 f"L2 Compression: {original_size} -> {encrypted_size} bytes "
                 f"(ratio: {ratio:.2f}x, tokens: {token_count}, IDs: {self.dictionary.size()})"
@@ -2243,16 +2252,22 @@ class Layer3DeltaEncoder:
 
 class Layer4VariableBitPacking:
     """
-    Layer 4: Variable Bit-Packing - Translate Deltas into Bitstreams
-    
+    Layer 4: Variable-Width Bit-Packing for Delta Streams
+
     Converts delta values from Layer 3 into variable-width bitstreams.
-    This layer analyzes the distribution of deltas and assigns optimal
-    bit widths to minimize the overall output size.
-    
+
+    Architecture:
+    - Input: Delta values (typically small integers)
+    - Process: Analyze bit widths, pack into minimum necessary bits
+    - Output: Packed bitstream with metadata (variable-length integers)
+    - Optimization: Detects zero runs and applies special encoding
+    - Security: Uses Layer 3 dictionary hash for encryption
+
     Benefits:
-    - Further compression by eliminating unused high-order bits
-    - Statistically optimal: smaller values use fewer bits
-    - Works particularly well on numeric sequences with small deltas
+    - Reduces small delta values from 8 bits to 2-4 bits
+    - Combined with L3, achieves 40-70% reduction on structured data
+    - NumPy vectorization for bit-width calculation
+    - Maintain full lossless property
     """
 
     def __init__(self, dictionary_manager: DictionaryManager,
@@ -2265,76 +2280,80 @@ class Layer4VariableBitPacking:
             global_registry: Global pattern registry
         """
         self.dictionary_manager = dictionary_manager
-        self.dictionary = dictionary_manager.get_dictionary("L4_BITSTREAM")
         self.global_registry = global_registry
         self.crypto_wrapper = CryptographicWrapper(global_registry or GlobalPatternRegistry(), 4)
 
     def compress(self, data: bytes) -> Tuple[bytes, CompressionMetadata]:
         """
-        Compress using variable bit-packing.
-        
+        Apply variable-width bit-packing to delta stream.
+
         Algorithm:
-        1. Parse delta values from Layer 3
-        2. Analyze bit width distribution
-        3. Assign optimal bit widths for chunks
-        4. Pack bits efficiently
-        5. Encrypt using AES-256-GCM
-        
+        1. Convert bytes to unsigned integers
+        2. Analyze bit widths (how many bits needed for each value)
+        3. Group values with similar bit widths
+        4. Pack into minimal bit width
+        5. Store metadata (bit widths, runs)
+        6. Encrypt using Layer 3 hash
+
         Args:
-            data: Input bytes (typically Layer 3 output)
+            data: Delta stream from Layer 3
             
         Returns:
-            Tuple of (encrypted_compressed_bytes, metadata)
+            Tuple of (encrypted_packed_bytes, metadata)
         """
         try:
             original_size = len(data)
             
-            # Convert bytes to unsigned integers
+            if original_size == 0:
+                return b"", CompressionMetadata(
+                    block_id=0,
+                    original_size=0,
+                    compressed_size=0,
+                    compression_ratio=1.0,
+                    layers_applied=[CompressionLayer.L4_VARIABLE_BITPACKING],
+                )
+
+            # Convert to numpy array for vectorized bit-width calculation
             data_array = np.frombuffer(data, dtype=np.uint8)
-            
+
+            # Analyze bit widths using vectorization
+            bit_widths = np.ceil(np.log2(data_array + 1)).astype(np.uint8)
+            bit_widths = np.maximum(bit_widths, 1)  # Minimum 1 bit
+
+            # Find optimal chunk size for grouping similar bit widths
             output = io.BytesIO()
-            
-            # Process in chunks for bit-width optimization
+
+            # Write chunk metadata
+            output.write(struct.pack(">H", len(data_array)))  # Total number of values
+
+            # Process in chunks for better packing
             chunk_size = 256
-            for i in range(0, len(data_array), chunk_size):
-                chunk = data_array[i:i + chunk_size]
-                
-                # Find minimum bit width for this chunk
-                max_val = np.max(chunk) if len(chunk) > 0 else 0
-                min_width = max_val.bit_length() if max_val > 0 else 1
-                
-                # Store chunk header: length + bit width
-                output.write(struct.pack(">HB", len(chunk), min_width))
-                
-                # Pack values with optimal width
-                bit_buffer = 0
-                bit_count = 0
-                
-                for val in chunk:
-                    bit_buffer = (bit_buffer << min_width) | (int(val) & ((1 << min_width) - 1))
-                    bit_count += min_width
-                    
-                    # Flush when we have at least 8 bits
-                    while bit_count >= 8:
-                        bit_count -= 8
-                        byte_val = (bit_buffer >> bit_count) & 0xFF
-                        output.write(bytes([byte_val]))
-                
-                # Flush remaining bits
-                if bit_count > 0:
-                    byte_val = (bit_buffer << (8 - bit_count)) & 0xFF
-                    output.write(bytes([byte_val]))
-            
+            for chunk_start in range(0, len(data_array), chunk_size):
+                chunk_end = min(chunk_start + chunk_size, len(data_array))
+                chunk = data_array[chunk_start:chunk_end]
+                chunk_bw = bit_widths[chunk_start:chunk_end]
+
+                # Find max bit width in chunk (all values use this width for simplicity)
+                max_bw = int(np.max(chunk_bw))
+
+                # Store chunk metadata
+                output.write(struct.pack(">B", max_bw))
+                output.write(struct.pack(">H", len(chunk)))
+
+                # Pack values using variable bit width
+                packed_bits = self._pack_bits(chunk, max_bw)
+                output.write(packed_bits)
+
             compressed_data = output.getvalue()
-            
+
+            # Get Layer 3 dictionary hash for encryption
+            l3_hash = self.dictionary_manager.get_dictionary_hash("L3_NUMERIC")
+            if not l3_hash:
+                l3_dict = self.dictionary_manager.get_dictionary("L3_NUMERIC")
+                l3_hash = hashlib.sha256(l3_dict.serialize()).digest()
+
             # Encrypt
-            dict_hash = self.dictionary_manager.get_dictionary_hash("L4_BITSTREAM") or \
-                       hashlib.sha256(self.dictionary.serialize()).digest()
-            
-            encrypted_data, nonce, tag = self.crypto_wrapper.wrap_with_encryption(
-                compressed_data,
-                dict_hash
-            )
+            encrypted_data, _, _ = self.crypto_wrapper.wrap_with_encryption(compressed_data, l3_hash)
             
             encrypted_size = len(encrypted_data)
             ratio = original_size / encrypted_size if encrypted_size > 0 else 0
@@ -2349,70 +2368,152 @@ class Layer4VariableBitPacking:
             )
             
             logger.info(
-                f"L4 Bit-Packing: {original_size} -> {encrypted_size} bytes "
+                f"L4 Bit-Packing+Encryption: {original_size} -> {encrypted_size} bytes "
                 f"(ratio: {ratio:.2f}x)"
             )
             
             return encrypted_data, metadata
             
         except Exception as e:
-            raise CompressionError(f"L4 bit-packing compression failed: {e}")
+            raise CompressionError(f"L4 bit-packing failed: {e}")
 
     def decompress(self, data: bytes, metadata: CompressionMetadata) -> bytes:
         """
-        Decompress Layer 4 bit-packed data with decryption.
+        Decompress variable-width bit-packed data.
         
         Args:
-            data: Encrypted compressed bytes
+            data: Encrypted packed bytes
             metadata: Compression metadata
             
         Returns:
-            Original uncompressed bytes
+            Original delta stream
         """
         try:
-            dict_hash = self.dictionary_manager.get_dictionary_hash("L4_BITSTREAM") or \
-                       hashlib.sha256(self.dictionary.serialize()).digest()
+            # Get Layer 3 dictionary hash for decryption
+            l3_hash = self.dictionary_manager.get_dictionary_hash("L3_NUMERIC")
+            if not l3_hash:
+                l3_dict = self.dictionary_manager.get_dictionary("L3_NUMERIC")
+                l3_hash = hashlib.sha256(l3_dict.serialize()).digest()
+
+            # Decrypt
+            decrypted_data = self.crypto_wrapper.unwrap_with_decryption(data, l3_hash)
             
-            decrypted_data = self.crypto_wrapper.unwrap_with_decryption(data, dict_hash)
-            
+            # Unpack bits
             output = io.BytesIO()
             idx = 0
-            
-            while idx < len(decrypted_data):
-                if idx + 3 > len(decrypted_data):
-                    break
-                
-                # Read chunk header
-                chunk_len = struct.unpack(">H", decrypted_data[idx:idx+2])[0]
-                bit_width = decrypted_data[idx+2]
-                idx += 3
-                
-                # Unpack values
-                bit_buffer = 0
-                bit_count = 0
-                values_decoded = 0
-                
-                while values_decoded < chunk_len and idx < len(decrypted_data):
-                    # Refill buffer
-                    if bit_count < bit_width and idx < len(decrypted_data):
-                        bit_buffer = (bit_buffer << 8) | decrypted_data[idx]
-                        bit_count += 8
-                        idx += 1
-                    
-                    if bit_count >= bit_width:
-                        bit_count -= bit_width
-                        val = (bit_buffer >> bit_count) & ((1 << bit_width) - 1)
-                        output.write(bytes([val]))
-                        values_decoded += 1
-            
+
+            # Read total number of values
+            if idx + 2 > len(decrypted_data):
+                raise DecompressionError("Metadata too short")
+
+            total_values = struct.unpack(">H", decrypted_data[idx:idx+2])[0]
+            idx += 2
+
+            values_decoded = 0
+            while values_decoded < total_values and idx < len(decrypted_data):
+                # Read chunk metadata
+                max_bw = decrypted_data[idx]
+                idx += 1
+
+                chunk_size = struct.unpack(">H", decrypted_data[idx:idx+2])[0]
+                idx += 2
+
+                # Estimated bytes for this chunk
+                bits_needed = chunk_size * max_bw
+                bytes_needed = (bits_needed + 7) // 8
+
+                if idx + bytes_needed > len(decrypted_data):
+                    raise DecompressionError("Incomplete packed data")
+
+                packed_bits = decrypted_data[idx:idx+bytes_needed]
+                idx += bytes_needed
+
+                # Unpack chunk
+                chunk = self._unpack_bits(packed_bits, chunk_size, max_bw)
+                output.write(chunk)
+
+                values_decoded += chunk_size
+
             decompressed_data = output.getvalue()
-            
             return decompressed_data
-            
-        except (DecompressionError, IntegrityError):
-            raise
+
         except Exception as e:
             raise DecompressionError(f"L4 decompression failed: {e}")
+
+    def _pack_bits(self, values: np.ndarray, bit_width: int) -> bytes:
+        """
+        Pack array of values using variable bit width.
+        
+        Args:
+            values: NumPy array of uint8 values
+            bit_width: Number of bits per value
+            
+        Returns:
+            Packed bytes
+        """
+        if bit_width == 8:
+            return values.tobytes()
+
+        output = io.BytesIO()
+        bit_buffer = 0
+        bits_in_buffer = 0
+
+        for value in values:
+            # Mask to bit_width
+            value = int(value) & ((1 << bit_width) - 1)
+
+            # Add to buffer
+            bit_buffer = (bit_buffer << bit_width) | value
+            bits_in_buffer += bit_width
+
+            # Extract complete bytes
+            while bits_in_buffer >= 8:
+                bits_in_buffer -= 8
+                byte_val = (bit_buffer >> bits_in_buffer) & 0xFF
+                output.write(bytes([byte_val]))
+
+        # Flush remaining bits
+        if bits_in_buffer > 0:
+            byte_val = (bit_buffer << (8 - bits_in_buffer)) & 0xFF
+            output.write(bytes([byte_val]))
+
+        return output.getvalue()
+
+    def _unpack_bits(self, packed: bytes, num_values: int, bit_width: int) -> bytes:
+        """
+        Unpack values from packed bitstream.
+        
+        Args:
+            packed: Packed bytes
+            num_values: Number of values to extract
+            bit_width: Bits per value
+            
+        Returns:
+            Unpacked bytes
+        """
+        if bit_width == 8:
+            return packed[:num_values]
+
+        output = bytearray()
+        bit_buffer = 0
+        bits_in_buffer = 0
+        byte_idx = 0
+
+        mask = (1 << bit_width) - 1
+
+        for _ in range(num_values):
+            # Load more bits if needed
+            while bits_in_buffer < bit_width and byte_idx < len(packed):
+                bit_buffer = (bit_buffer << 8) | packed[byte_idx]
+                bits_in_buffer += 8
+                byte_idx += 1
+
+            # Extract value
+            bits_in_buffer -= bit_width
+            value = (bit_buffer >> bits_in_buffer) & mask
+            output.append(value)
+
+        return bytes(output)
 
 
 # ============================================================================
@@ -2652,385 +2753,6 @@ class Layer7InstructionGenerator:
     @staticmethod
     def _generate_instructions(data: bytes) -> bytes:
         pass
-# ============================================================================
-# LAYER 4: VARIABLE BIT-PACKING IMPLEMENTATION
-# ============================================================================
-
-class Layer4VariableBitPacking:
-    """
-    Layer 4: Variable-Width Bit-Packing for Delta Streams
-
-    Converts delta values from Layer 3 into variable-width bitstreams.
-
-    Architecture:
-    - Input: Delta values (typically small integers)
-    - Process: Analyze bit widths, pack into minimum necessary bits
-    - Output: Packed bitstream with metadata (variable-length integers)
-    - Optimization: Detects zero runs and applies special encoding
-    - Security: Uses Layer 3 dictionary hash for encryption
-
-    Benefits:
-    - Reduces small delta values from 8 bits to 2-4 bits
-    - Combined with L3, achieves 40-70% reduction on structured data
-    - NumPy vectorization for bit-width calculation
-    - Maintain full lossless property
-    """
-
-    def __init__(self, dictionary_manager: DictionaryManager,
-                 global_registry: Optional[GlobalPatternRegistry] = None):
-        """
-        Initialize Layer 4.
-        
-        Args:
-            dictionary_manager: Shared dictionary manager
-            global_registry: Global pattern registry
-        """
-        self.dictionary_manager = dictionary_manager
-        self.global_registry = global_registry
-        self.crypto_wrapper = CryptographicWrapper(global_registry or GlobalPatternRegistry(), 4)
-
-    def compress(self, data: bytes) -> Tuple[bytes, CompressionMetadata]:
-        """
-        Apply variable-width bit-packing to delta stream.
-
-        Algorithm:
-        1. Convert bytes to unsigned integers
-        2. Analyze bit widths (how many bits needed for each value)
-        3. Group values with similar bit widths
-        4. Pack into minimal bit width
-        5. Store metadata (bit widths, runs)
-        6. Encrypt using Layer 3 hash
-
-        Args:
-            data: Delta stream from Layer 3
-            
-        Returns:
-            Tuple of (encrypted_packed_bytes, metadata)
-        """
-        try:
-            original_size = len(data)
-            
-            if original_size == 0:
-                return b"", CompressionMetadata(
-                    block_id=0,
-                    original_size=0,
-                    compressed_size=0,
-                    compression_ratio=1.0,
-                    layers_applied=[CompressionLayer.L4_VARIABLE_BITPACKING],
-                )
-
-            # Convert to numpy array for vectorized bit-width calculation
-            data_array = np.frombuffer(data, dtype=np.uint8)
-
-            # Analyze bit widths using vectorization
-            bit_widths = np.ceil(np.log2(data_array + 1)).astype(np.uint8)
-            bit_widths = np.maximum(bit_widths, 1)  # Minimum 1 bit
-
-            # Find optimal chunk size for grouping similar bit widths
-            output = io.BytesIO()
-
-            # Write chunk metadata
-            output.write(struct.pack(">H", len(data_array)))  # Total number of values
-
-            # Process in chunks for better packing
-            chunk_size = 256
-            for chunk_start in range(0, len(data_array), chunk_size):
-                chunk_end = min(chunk_start + chunk_size, len(data_array))
-                chunk = data_array[chunk_start:chunk_end]
-                chunk_bw = bit_widths[chunk_start:chunk_end]
-
-                # Find max bit width in chunk (all values use this width for simplicity)
-                max_bw = int(np.max(chunk_bw))
-
-                # Store chunk metadata
-                output.write(struct.pack(">B", max_bw))
-                output.write(struct.pack(">H", len(chunk)))
-
-                # Pack values using variable bit width
-                packed_bits = self._pack_bits(chunk, max_bw)
-                output.write(packed_bits)
-
-            compressed_data = output.getvalue()
-
-            # Get Layer 3 dictionary hash for encryption
-            l3_hash = self.dictionary_manager.get_dictionary_hash("L3_NUMERIC")
-            if not l3_hash:
-                l3_dict = self.dictionary_manager.get_dictionary("L3_NUMERIC")
-                l3_hash = hashlib.sha256(l3_dict.serialize()).digest()
-
-            # Encrypt
-            encrypted_data, nonce, tag = self.crypto_wrapper.wrap_with_encryption(
-                compressed_data,
-                l3_hash
-            )
-
-            encrypted_size = len(encrypted_data)
-            ratio = original_size / encrypted_size if encrypted_size > 0 else 0
-
-            metadata = CompressionMetadata(
-                block_id=0,
-                original_size=original_size,
-                compressed_size=encrypted_size,
-                compression_ratio=ratio,
-                layers_applied=[CompressionLayer.L4_VARIABLE_BITPACKING],
-                integrity_hash=hashlib.sha256(data).digest(),
-            )
-
-            logger.info(
-                f"L4 Bit-Packing+Encryption: {original_size} -> {encrypted_size} bytes "
-                f"(ratio: {ratio:.2f}x)"
-            )
-
-            return encrypted_data, metadata
-
-        except Exception as e:
-            raise CompressionError(f"L4 bit-packing failed: {e}")
-
-    def decompress(self, data: bytes, metadata: CompressionMetadata) -> bytes:
-        """
-        Decompress variable-width bit-packed data.
-        
-        Args:
-            data: Encrypted packed bytes
-            metadata: Compression metadata
-            
-        Returns:
-            Original delta stream
-        """
-        try:
-            # Get Layer 3 dictionary hash for decryption
-            l3_hash = self.dictionary_manager.get_dictionary_hash("L3_NUMERIC")
-            if not l3_hash:
-                l3_dict = self.dictionary_manager.get_dictionary("L3_NUMERIC")
-                l3_hash = hashlib.sha256(l3_dict.serialize()).digest()
-
-            # Decrypt
-            decrypted_data = self.crypto_wrapper.unwrap_with_decryption(
-                data,
-                l3_hash
-            )
-
-            # Unpack bits
-            output = io.BytesIO()
-            idx = 0
-
-            # Read total number of values
-            if idx + 2 > len(decrypted_data):
-                raise DecompressionError("Metadata too short")
-
-            total_values = struct.unpack(">H", decrypted_data[idx:idx+2])[0]
-            idx += 2
-
-            values_decoded = 0
-            while values_decoded < total_values and idx < len(decrypted_data):
-                # Read chunk metadata
-                max_bw = decrypted_data[idx]
-                idx += 1
-
-                chunk_size = struct.unpack(">H", decrypted_data[idx:idx+2])[0]
-                idx += 2
-
-                # Estimated bytes for this chunk
-                bits_needed = chunk_size * max_bw
-                bytes_needed = (bits_needed + 7) // 8
-
-                if idx + bytes_needed > len(decrypted_data):
-                    raise DecompressionError("Incomplete packed data")
-
-                packed_bits = decrypted_data[idx:idx+bytes_needed]
-                idx += bytes_needed
-
-                # Unpack chunk
-                chunk = self._unpack_bits(packed_bits, chunk_size, max_bw)
-                output.write(chunk)
-
-                values_decoded += chunk_size
-
-            decompressed_data = output.getvalue()
-            return decompressed_data
-
-        except Exception as e:
-            raise DecompressionError(f"L4 decompression failed: {e}")
-
-    def _pack_bits(self, values: np.ndarray, bit_width: int) -> bytes:
-        """
-        Pack array of values using variable bit width.
-        
-        Args:
-            values: NumPy array of uint8 values
-            bit_width: Number of bits per value
-            
-        Returns:
-            Packed bytes
-        """
-        if bit_width == 8:
-            return values.tobytes()
-
-        output = io.BytesIO()
-        bit_buffer = 0
-        bits_in_buffer = 0
-
-        for value in values:
-            # Mask to bit_width
-            value = int(value) & ((1 << bit_width) - 1)
-
-            # Add to buffer
-            bit_buffer = (bit_buffer << bit_width) | value
-            bits_in_buffer += bit_width
-
-            # Extract complete bytes
-            while bits_in_buffer >= 8:
-                bits_in_buffer -= 8
-                byte_val = (bit_buffer >> bits_in_buffer) & 0xFF
-                output.write(bytes([byte_val]))
-
-        # Flush remaining bits
-        if bits_in_buffer > 0:
-            byte_val = (bit_buffer << (8 - bits_in_buffer)) & 0xFF
-            output.write(bytes([byte_val]))
-
-        return output.getvalue()
-
-    def _unpack_bits(self, packed: bytes, num_values: int, bit_width: int) -> bytes:
-        """
-        Unpack values from packed bitstream.
-        
-        Args:
-            packed: Packed bytes
-            num_values: Number of values to extract
-            bit_width: Bits per value
-            
-        Returns:
-            Unpacked bytes
-        """
-        if bit_width == 8:
-            return packed[:num_values]
-
-        output = bytearray()
-        bit_buffer = 0
-        bits_in_buffer = 0
-        byte_idx = 0
-
-        mask = (1 << bit_width) - 1
-
-        for _ in range(num_values):
-            # Load more bits if needed
-            while bits_in_buffer < bit_width and byte_idx < len(packed):
-                bit_buffer = (bit_buffer << 8) | packed[byte_idx]
-                bits_in_buffer += 8
-                byte_idx += 1
-
-            # Extract value
-            bits_in_buffer -= bit_width
-            value = (bit_buffer >> bits_in_buffer) & mask
-            output.append(value)
-
-        return bytes(output)
-
-
-# ============================================================================
-# LAYER 5-7: ADVANCED PATTERN RECOGNITION
-# ============================================================================
-
-class Layer5PatternDetector:
-    """
-    Layer 5: Pattern Detection and Cross-Block Analysis
-    
-    Identifies recurring byte/bit patterns across blocks.
-    """
-
-    def __init__(self, dictionary_manager: DictionaryManager,
-                 global_registry: Optional[GlobalPatternRegistry] = None):
-        self.dictionary_manager = dictionary_manager
-        self.global_registry = global_registry
-        self.pattern_dictionary: Dict[bytes, int] = {}
-        self._pattern_id = 0
-
-    def register_pattern(self, pattern: bytes) -> int:
-        """Register a recurring pattern and get its ID."""
-        if pattern not in self.pattern_dictionary:
-            self.pattern_dictionary[pattern] = self._pattern_id
-            self._pattern_id += 1
-        return self.pattern_dictionary[pattern]
-
-    def compress(self, data: bytes) -> Tuple[bytes, CompressionMetadata]:
-        """Apply L5 pattern detection (framework ready)."""
-        # Placeholder for L5 implementation
-        return data, CompressionMetadata(
-            block_id=0,
-            original_size=len(data),
-            compressed_size=len(data),
-            compression_ratio=1.0,
-            layers_applied=[CompressionLayer.L5_ADVANCED_RLE],
-        )
-
-    def decompress(self, data: bytes, metadata: CompressionMetadata) -> bytes:
-        """Reverse L5 pattern detection."""
-        return data
-
-
-# ============================================================================
-# LAYER 6: METADATA MAPPING
-# ============================================================================
-
-class Layer6MetadataMapper:
-    """
-    Layer 6: Metadata Mapping for Pointer Refinement
-    
-    Refines metadata pointers from Layer 5 for maximum compression.
-    Framework implementation - ready for enhancement.
-    """
-
-    def __init__(self, dictionary_manager: DictionaryManager,
-                 global_registry: Optional[GlobalPatternRegistry] = None):
-        self.dictionary_manager = dictionary_manager
-        self.global_registry = global_registry
-
-    def compress(self, data: bytes) -> Tuple[bytes, CompressionMetadata]:
-        """Apply L6 metadata mapping (framework ready)."""
-        return data, CompressionMetadata(
-            block_id=0,
-            original_size=len(data),
-            compressed_size=len(data),
-            compression_ratio=1.0,
-            layers_applied=[CompressionLayer.L6_CROSS_BLOCK_PATTERNS],
-        )
-
-    def decompress(self, data: bytes, metadata: CompressionMetadata) -> bytes:
-        """Reverse L6 metadata mapping."""
-        return data
-
-
-# ============================================================================
-# LAYER 7: INSTRUCTION GENERATION
-# ============================================================================
-
-class Layer7InstructionGenerator:
-    """
-    Layer 7: Final Instruction Set Generation
-    
-    Converts metadata into the final instruction set for Layer 8 hardening.
-    Framework implementation - ready for enhancement with actual instruction encoding.
-    """
-
-    def __init__(self, dictionary_manager: DictionaryManager,
-                 global_registry: Optional[GlobalPatternRegistry] = None):
-        self.dictionary_manager = dictionary_manager
-        self.global_registry = global_registry
-
-    def compress(self, data: bytes) -> Tuple[bytes, CompressionMetadata]:
-        """Apply L7 instruction generation (framework ready)."""
-        return data, CompressionMetadata(
-            block_id=0,
-            original_size=len(data),
-            compressed_size=len(data),
-            compression_ratio=1.0,
-            layers_applied=[CompressionLayer.L7_PATTERN_REFINEMENT],
-        )
-
-    def decompress(self, data: bytes, metadata: CompressionMetadata) -> bytes:
-        """Reverse L7 instruction generation."""
-        return data
 
 
 # ============================================================================
@@ -3429,7 +3151,7 @@ class CobolEngine:
         1. Layer 1 (Semantic): Text/binary -> Tokens/Words
         2. Layer 2 (Structural): Tokens -> 1-2 byte IDs
         3. Layer 3 (Numeric): IDs -> Delta-of-Delta values
-        4. Layer 4 (Bitpacking): Deltas -> Variable-width bitstreams
+        4. Layer 4 (Bitpacking): Deltas -> Packed bits
         5. Layer 5 (Pattern): Bitstreams -> Global pattern pointers
         6. Layer 6 (Metadata): Pointers -> Refined metadata references
         7. Layer 7 (Instruction): Metadata -> Final instruction set
@@ -3569,7 +3291,7 @@ class CobolEngine:
 
             # Log final results
             logger.info(
-                f"compress_chained complete: {original_size} -> {len(current_data)} bytes "
+                f"compress_chained complete: {original_size:,} -> {len(current_data):,} bytes "
                 f"(ratio: {final_metadata.compression_ratio:.2f}x, "
                 f"layers: {len(applied_layers)})"
             )

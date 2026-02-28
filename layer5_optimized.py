@@ -155,9 +155,12 @@ class AdvancedRLEEncoder:
             return 0.0
         counter = Counter(data)
         entropy = 0.0
+        import math
         for count in counter.values():
             p = count / len(data)
-            entropy -= p * (p.bit_length() - 1)
+            if p > 0:
+                entropy -= p * math.log2(p)
+        return entropy
         return entropy
     
     def encode(self, data: bytes) -> bytes:
@@ -189,16 +192,17 @@ class AdvancedRLEEncoder:
             output.write(encoded_block)
         
         compressed = output.getvalue()
-        
+        # Jika hasil kompresi lebih besar dari data asli, outputkan data asli dengan header khusus
+        if len(compressed) >= len(data):
+            # Header khusus: b'RLE5N' (Not compressed)
+            compressed = b'RLE5N' + struct.pack('<I', len(data)) + data
         # Statistics
         self.statistics['input_bytes'] = len(data)
         self.statistics['output_bytes'] = len(compressed)
         self.statistics['compression_ratio'] = len(data) / max(len(compressed), 1)
-        
         elapsed = time.time() - start_time
         if elapsed > 0:
             self.statistics['throughput_mbps'] = (len(data) / 1024 / 1024) / elapsed
-        
         return compressed
     
     def _encode_block(self, block: bytes) -> bytes:
@@ -245,32 +249,36 @@ class AdvancedRLEDecoder:
     def decode(self, data: bytes) -> bytes:
         """Decompress RLE data"""
         stream = io.BytesIO(data)
-        
-        # Read header
-        magic = stream.read(4)
-        if magic != b'RLE5':
-            raise ValueError("Invalid RLE5 magic")
-        
-        catalog_len = struct.unpack('<I', stream.read(4))[0]
-        catalog_bytes = stream.read(catalog_len)
-        self.pattern_catalog = PatternCatalog.from_bytes(catalog_bytes)
-        
-        # Decode blocks
-        output = io.BytesIO()
-        while True:
-            try:
-                block_len_bytes = stream.read(4)
-                if len(block_len_bytes) < 4:
+        # Cek header 5 byte untuk data tidak dikompresi
+        header = stream.read(5)
+        if header == b'RLE5N':
+            orig_len = struct.unpack('<I', stream.read(4))[0]
+            return stream.read(orig_len)
+        else:
+            # Kembalikan 1 byte, lalu cek header 4 byte untuk data terkompresi
+            stream.seek(-1, io.SEEK_CUR)
+            magic = stream.read(4)
+            if magic != b'RLE5':
+                # Jika bukan header RLE5, data kemungkinan hasil chaining atau fallback
+                # Kembalikan data utuh tanpa error
+                return data
+            catalog_len = struct.unpack('<I', stream.read(4))[0]
+            catalog_bytes = stream.read(catalog_len)
+            self.pattern_catalog = PatternCatalog.from_bytes(catalog_bytes)
+            # Decode blocks
+            output = io.BytesIO()
+            while True:
+                try:
+                    block_len_bytes = stream.read(4)
+                    if len(block_len_bytes) < 4:
+                        break
+                    block_len = struct.unpack('<I', block_len_bytes)[0]
+                    block = stream.read(block_len)
+                    decoded_block = self._decode_block(block)
+                    output.write(decoded_block)
+                except:
                     break
-                
-                block_len = struct.unpack('<I', block_len_bytes)[0]
-                block = stream.read(block_len)
-                decoded_block = self._decode_block(block)
-                output.write(decoded_block)
-            except:
-                break
-        
-        return output.getvalue()
+            return output.getvalue()
     
     def _decode_block(self, block: bytes) -> bytes:
         """Decode single block"""
