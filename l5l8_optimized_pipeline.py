@@ -21,6 +21,8 @@ from enum import Enum
 from collections import defaultdict, Counter
 from multiprocessing import Pool, cpu_count
 import numpy as np
+import math
+import zlib
 from abc import ABC, abstractmethod
 
 
@@ -57,9 +59,12 @@ class OptimizedLayer5:
             pattern = data[i:i+2]
             pattern_freq[pattern] += 1
         
-        # Check 4-byte patterns
+        # Check 4-byte and 8-byte patterns
         for i in range(0, len(data) - 3, 4):
             pattern = data[i:i+4]
+            pattern_freq[pattern] += 1
+        for i in range(0, len(data) - 7, 8):
+            pattern = data[i:i+8]
             pattern_freq[pattern] += 1
         
         # Filter: only patterns with ROI > 0
@@ -72,15 +77,19 @@ class OptimizedLayer5:
         
         return dict(sorted(profitable.items(), key=lambda x: x[1], reverse=True)[:self.max_patterns])
     
-    def encode(self, data: bytes) -> bytes:
+    def encode(self, data: bytes, seed_patterns: Optional[Dict[bytes,int]] = None) -> bytes:
         """Optimized Layer 5 encoding"""
         start_time = time.time()
         
         if not data:
             return b'\x00\x00\x00\x00'
         
-        # Phase 1: Pattern analysis
-        patterns = self._analyze_patterns_fast(data)
+        # Phase 1: Pattern analysis (use seed patterns if provided)
+        if seed_patterns:
+            # seed_patterns is mapping pattern->id or pattern->freq; normalize to keys
+            patterns = {p: seed_patterns.get(p, 1) for p in seed_patterns.keys()}
+        else:
+            patterns = self._analyze_patterns_fast(data)
         pattern_map = {p: i for i, p in enumerate(patterns.keys())}
         
         # Phase 2: Encoding
@@ -131,6 +140,11 @@ class OptimizedLayer5:
             'time_ms': elapsed,
             'patterns': len(patterns)
         }
+        # Expose catalog for seeding across passes
+        try:
+            self.pattern_catalog = list(patterns.keys())
+        except Exception:
+            self.pattern_catalog = []
         
         return result
     
@@ -185,9 +199,10 @@ class OptimizedLayer5:
 class OptimizedLayer6:
     """Layer 6: Structural pattern dictionary using Trie - Optimized for speed"""
     
-    def __init__(self, max_patterns: int = 65535, use_gpu: bool = False):
+    def __init__(self, max_patterns: int = 65535, use_gpu: bool = False, batch_size: int = 1 << 20):
         self.max_patterns = max_patterns
         self.use_gpu = use_gpu and self._check_gpu_available()
+        self.batch_size = batch_size
         self.patterns = {}  # pattern_id -> bytes
         self.id_map = {}    # bytes -> pattern_id
         self.next_id = 0
@@ -215,27 +230,81 @@ class OptimizedLayer6:
         self.next_id += 1
         return pattern_id
     
-    def encode(self, data: bytes) -> bytes:
-        """Optimized Layer 6 encoding"""
+    def encode(self, data: bytes, seed_patterns: Optional[Dict[bytes,int]] = None, batch_size: Optional[int] = None) -> bytes:
+        """Optimized Layer 6 encoding with optional batch sizing and seeding"""
         start_time = time.time()
-        
+
         if not data:
             return struct.pack('<I', 0)
-        
-        # Phase 1: Find repeating patterns (2-16 bytes)
+
+        # Phase 1: Find repeating patterns (2-16 bytes) or use seed patterns
         pattern_freq = defaultdict(int)
-        
-        for length in [2, 3, 4, 8, 16]:
-            if length > len(data):
-                continue
-            for i in range(len(data) - length + 1):
-                pattern = data[i:i+length]
-                pattern_freq[pattern] += 1
-        
-        # Phase 2: Add profitable patterns
-        for pattern, freq in sorted(pattern_freq.items(), key=lambda x: x[1], reverse=True):
-            if freq >= 2:
-                self._add_pattern(pattern)
+        bs = batch_size or getattr(self, 'batch_size', 1 << 20)
+
+        if seed_patterns:
+            # Seed provided: pre-populate dictionary with seeds (freq ignored)
+            for p in seed_patterns.keys():
+                self._add_pattern(p)
+        else:
+            data_len = len(data)
+            # If GPU available, accelerate 2-byte and 4-byte pattern counting
+            if self.use_gpu:
+                try:
+                    import cupy as cp
+                    arr = cp.frombuffer(data, dtype=cp.uint8)
+                    # 2-byte patterns
+                    if data_len >= 2:
+                        a0 = arr[:-1].astype(cp.uint16)
+                        a1 = arr[1:].astype(cp.uint16)
+                        packed = (a0 << 8) | a1
+                        counts = cp.bincount(packed)
+                        nonzero = cp.nonzero(counts)[0]
+                        for v in cp.asnumpy(nonzero):
+                            cnt = int(counts[int(v)].item())
+                            if cnt >= 2:
+                                pattern = bytes([int(v >> 8), int(v & 0xFF)])
+                                pattern_freq[pattern] += cnt
+                    # 4-byte patterns (pack into uint32 may overflow on very large data, but ok for counts)
+                    if data_len >= 4:
+                        a0 = arr[:-3].astype(cp.uint32)
+                        a1 = arr[1:-2].astype(cp.uint32)
+                        a2 = arr[2:-1].astype(cp.uint32)
+                        a3 = arr[3:].astype(cp.uint32)
+                        packed4 = (a0 << 24) | (a1 << 16) | (a2 << 8) | a3
+                        counts4 = cp.bincount(packed4)
+                        nonzero4 = cp.nonzero(counts4)[0]
+                        for v in cp.asnumpy(nonzero4):
+                            cnt = int(counts4[int(v)].item())
+                            if cnt >= 2:
+                                b0 = (v >> 24) & 0xFF
+                                b1 = (v >> 16) & 0xFF
+                                b2 = (v >> 8) & 0xFF
+                                b3 = v & 0xFF
+                                pattern = bytes([b0, b1, b2, b3])
+                                pattern_freq[pattern] += cnt
+                except Exception:
+                    # fall back to CPU scanning
+                    pass
+
+            # Chunked scanning to control memory and enable batch tuning
+            for start in range(0, data_len, bs):
+                chunk = data[start:start+bs]
+                for length in [2, 3, 4, 8, 16, 32, 64]:
+                    if length > len(chunk):
+                        continue
+                    for i in range(len(chunk) - length + 1):
+                        pattern = chunk[i:i+length]
+                        pattern_freq[pattern] += 1
+
+            # Phase 2: Add profitable patterns using ROI filter
+            for pattern, freq in sorted(pattern_freq.items(), key=lambda x: x[1], reverse=True):
+                if freq < 2:
+                    continue
+                # estimate catalog cost (id + length + bytes)
+                catalog_cost = len(pattern) + 3
+                savings = (len(pattern) - 1) * freq - catalog_cost
+                if savings > 0:
+                    self._add_pattern(pattern)
         
         # Phase 3: Encode data using patterns
         output = io.BytesIO()
@@ -283,7 +352,8 @@ class OptimizedLayer6:
             'output': len(result),
             'ratio': len(result) / len(data) if data else 1.0,
             'time_ms': elapsed,
-            'patterns': len(self.patterns)
+            'patterns': len(self.patterns),
+            'batch_size': bs
         }
         
         return result
@@ -345,39 +415,66 @@ class OptimizedLayer7:
         self.stats = {}
     
     def encode(self, data: bytes) -> bytes:
-        """Optimized Layer 7 encoding - Passthrough if not beneficial"""
+        """Optimized Layer 7 encoding - adaptive: zlib if entropy is low enough, otherwise passthrough"""
         start_time = time.time()
-        
+
         if not data:
-            return b'\x00'  # Flag: passthrough, empty
-        
-        # For data already compressed from Layer 5-6, entropy coding rarely helps
-        # Use simple passthrough marking instead
-        result = b'\x01' + data  # Flag: passthrough, with data
-        
+            return b'\x00'
+
+        # Compute Shannon entropy
+        freq = Counter(data)
+        total = len(data)
+        entropy = 0.0
+        for v in freq.values():
+            p = v / total
+            entropy -= p * math.log2(p)
+
+        # Threshold: if entropy below 6.0 bits/byte, try compression
+        threshold = 6.0
+        if entropy < threshold:
+            # Try zlib compression as an efficient entropy coder fallback
+            compressed = zlib.compress(data)
+            # Use only if compressed is smaller
+            if len(compressed) < len(data):
+                result = b'\x02' + struct.pack('<I', len(compressed)) + compressed
+                method = 'zlib'
+            else:
+                result = b'\x01' + data
+                method = 'passthrough'
+        else:
+            result = b'\x01' + data
+            method = 'passthrough'
+
         elapsed = (time.time() - start_time) * 1000
-        
+
         self.stats = {
             'input': len(data),
             'output': len(result),
             'ratio': len(result) / len(data) if data else 1.0,
             'time_ms': elapsed,
-            'method': 'passthrough'
+            'method': method,
+            'entropy': entropy
         }
-        
+
         return result
     
     def decode(self, data: bytes) -> bytes:
         """Optimized Layer 7 decoding"""
         if not data:
             return b''
-        
+
         flag = data[0]
-        
         if flag == 0:
             return b''
         elif flag == 1:
             return data[1:]
+        elif flag == 2:
+            # zlib compressed
+            if len(data) < 5:
+                return b''
+            clen = struct.unpack('<I', data[1:5])[0]
+            comp = data[5:5+clen]
+            return zlib.decompress(comp)
         else:
             return data[1:]
 
@@ -452,28 +549,68 @@ class OptimizedL5L8Pipeline:
         self.num_workers = num_workers or cpu_count()
         self.stats = CompressionStats()
     
-    def compress(self, data: bytes) -> bytes:
+    def compress(self, data: bytes, max_passes: Optional[int] = None) -> bytes:
         """Full L5-L8 compression pipeline"""
         start_time = time.time()
-        
-        # L5: RLE + Pattern compression
-        l5_result = self.layer5.encode(data)
-        
-        # L6: Trie dictionary compression
-        l6_result = self.layer6.encode(l5_result)
-        
-        # L7: Huffman entropy coding
-        l7_result = self.layer7.encode(l6_result)
-        
-        # L8: Integrity frame
-        l8_result = self.layer8.encode(l7_result)
-        
+
+        # Iterative multi-pass compression to converge dictionaries across L5-L6
+        max_passes = max_passes or 3
+        best_output = None
+        best_size = None
+        seed5 = None
+        seed6 = None
+
+        for p in range(max_passes):
+            # L5 (optionally seeded)
+            l5_result = self.layer5.encode(data, seed_patterns=seed5)
+
+            # L6 (optionally seeded)
+            l6_result = self.layer6.encode(l5_result, seed_patterns=seed6)
+
+            # L7
+            l7_result = self.layer7.encode(l6_result)
+
+            # L8
+            l8_result = self.layer8.encode(l7_result)
+
+            size = len(l8_result)
+
+            # Update best
+            if best_size is None or size < best_size:
+                best_size = size
+                best_output = l8_result
+                # Prepare seeds for next pass: take top patterns
+                try:
+                    # Layer5 catalog
+                    seed5 = {p: 1 for p in getattr(self.layer5, 'pattern_catalog', [])}
+                except Exception:
+                    seed5 = None
+
+                try:
+                    # Layer6 patterns: patterns is dict id->bytes
+                    layer6_patterns = getattr(self.layer6, 'patterns', {})
+                    # invert to patterns->id
+                    seed6 = {v: 1 for v in layer6_patterns.values()}
+                except Exception:
+                    seed6 = None
+            else:
+                # If no improvement, break early
+                break
+
+            # Small improvement check: if next pass unlikely to help, break
+            if p > 0:
+                improvement = (prev_size - size) / prev_size if prev_size and prev_size > 0 else 0
+                if improvement < 0.005:
+                    break
+            prev_size = size
+
         elapsed = time.time() - start_time
-        
+
+        # Final stats from last run
         self.stats = CompressionStats(
             input_size=len(data),
-            output_size=len(l8_result),
-            compression_ratio=len(data) / len(l8_result) if l8_result else 1.0,
+            output_size=len(best_output) if best_output else 0,
+            compression_ratio=len(data) / len(best_output) if best_output else 1.0,
             throughput_mbps=len(data) / elapsed / 1024 / 1024 if elapsed > 0 else 0,
             elapsed_time_ms=elapsed * 1000,
             layer_stats={
@@ -483,8 +620,8 @@ class OptimizedL5L8Pipeline:
                 'l8': self.layer8.stats
             }
         )
-        
-        return l8_result
+
+        return best_output
     
     def decompress(self, data: bytes) -> bytes:
         """Full L5-L8 decompression pipeline"""

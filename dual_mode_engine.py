@@ -12,6 +12,7 @@ import enum
 class CompressionMode(enum.Enum):
     LEGACY = "legacy"  # Uses layer5_optimized, layer6_optimized, layer7_optimized
     BRIDGE = "bridge"  # Uses new L1-L8 protocol bridge
+    MAXIMAL = "maximal"  # Uses L1-L4 bridge + optimized L5-L8 pipeline (max compression)
 
 
 class DualModeEngine:
@@ -24,6 +25,14 @@ class DualModeEngine:
         self.mode = mode
         self._init_legacy_layers()
         self._init_bridge_layers()
+        # Try initialize optimized L5-L8 pipeline if available
+        try:
+            from l5l8_optimized_pipeline import OptimizedL5L8Pipeline
+            self.optimized_l5l8 = OptimizedL5L8Pipeline()
+            self.optimized_available = True
+        except Exception:
+            self.optimized_l5l8 = None
+            self.optimized_available = False
     
     def _init_legacy_layers(self):
         """Initialize legacy layer5/6/7_optimized implementations"""
@@ -78,24 +87,10 @@ class DualModeEngine:
             return self._compress_legacy(data)
         elif self.mode == CompressionMode.BRIDGE:
             return self._compress_bridge(data)
+        elif self.mode == CompressionMode.MAXIMAL:
+            return self._compress_maximal(data)
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
-        def _calculate_entropy(self, data: bytes) -> float:
-            """
-            Hitung entropi Shannon (bits/byte) dari data.
-            """
-            if not data:
-                return 0.0
-            from math import log2
-            freq = {}
-            for b in data:
-                freq[b] = freq.get(b, 0) + 1
-            total = len(data)
-            entropy = 0.0
-            for count in freq.values():
-                p = count / total
-                entropy -= p * log2(p)
-            return entropy * 8  # bits/byte
     
     def decompress(self, data: bytes) -> bytes:
         """
@@ -106,11 +101,14 @@ class DualModeEngine:
         
         Returns:
             Original uncompressed bytes
+
         """
         if self.mode == CompressionMode.LEGACY:
             return self._decompress_legacy(data)
         elif self.mode == CompressionMode.BRIDGE:
             return self._decompress_bridge(data)
+        elif self.mode == CompressionMode.MAXIMAL:
+            return self._decompress_maximal(data)
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
     
@@ -123,7 +121,7 @@ class DualModeEngine:
         l5_comp = self.l5_legacy.compress(data)
         l6_comp = self.l6_legacy.compress(l5_comp)
         l7_comp = self.l7_legacy.compress(l6_comp)
-        
+
         return l7_comp
     
     def _decompress_legacy(self, data: bytes) -> bytes:
@@ -181,6 +179,50 @@ class DualModeEngine:
             return decompressed.data.encode('utf-8')
         else:
             return decompressed.data
+
+    def _decompress_maximal(self, data: bytes) -> bytes:
+        """Reverse of _compress_maximal: decompress using full bridge L1-L8."""
+        if not self.bridge_available:
+            raise RuntimeError("Protocol bridge not available")
+
+        from protocol_bridge import TypedBuffer, ProtocolLanguage
+
+        # Reconstruct L8 input from compressed bytes
+        if isinstance(data, bytes):
+            pic_x_str = data.decode('utf-8', errors='ignore')
+        else:
+            pic_x_str = str(data)
+
+        buffer = TypedBuffer.create(pic_x_str, ProtocolLanguage.L8_COBOL, str)
+
+        # Decompress through full L1-L8 bridge
+        decompressed = self.bridge.decompress(buffer)
+
+        # Return as bytes
+        if isinstance(decompressed.data, str):
+            return decompressed.data.encode('utf-8')
+        else:
+            return decompressed.data if isinstance(decompressed.data, (bytes, bytearray)) else str(decompressed.data).encode('utf-8')
+
+    def _compress_maximal(self, data: bytes) -> bytes:
+        """Maximal compression: use full bridge L1-L8 for maximum compatibility and compression."""
+        if not self.bridge_available:
+            raise RuntimeError("Protocol bridge not available")
+
+        from protocol_bridge import TypedBuffer, ProtocolLanguage
+
+        # Convert bytes to text for L1 input
+        text = data.decode('utf-8', errors='ignore')
+        buffer = TypedBuffer.create(text, ProtocolLanguage.L1_SEM, str)
+
+        # Compress through full L1-L8 bridge
+        compressed = self.bridge.compress(buffer)
+
+        # Return as bytes (L8 output is PIC X string or binary)
+        if isinstance(compressed.data, str):
+            return compressed.data.encode('utf-8')
+        else:
+            return compressed.data if isinstance(compressed.data, (bytes, bytearray)) else str(compressed.data).encode('utf-8')
     
     def switch_mode(self, mode: CompressionMode):
         """Switch between legacy and bridge mode"""
@@ -208,6 +250,23 @@ class DualModeEngine:
             stats["l5_stats"] = self.l5_legacy.get_statistics()
         
         return stats
+
+    def _calculate_entropy(self, data: bytes) -> float:
+        """
+        Hitung entropi Shannon (bits/byte) dari data.
+        """
+        if not data:
+            return 0.0
+        from math import log2
+        freq = {}
+        for b in data:
+            freq[b] = freq.get(b, 0) + 1
+        total = len(data)
+        entropy = 0.0
+        for count in freq.values():
+            p = count / total
+            entropy -= p * log2(p)
+        return entropy  # bits per symbol (byte)
 
 
 # Convenience functions for backward compatibility
